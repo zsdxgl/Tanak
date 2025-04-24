@@ -1,0 +1,397 @@
+1. genome assembly using Falcon
+	cat fc_run.cfg
+		[General]
+		#sge_option_da =
+		#sge_option_la =
+		#sge_option_pda =
+		#sge_option_pla =
+		#sge_option_cns =
+		#sge_option_fc =
+		#pwatcher_type = blocking
+		#job_type = string
+		#job_queue = bash -C ${CMD} >| ${STDOUT_FILE} 2>| ${STDERR_FILE}
+
+		# list of files of the initial bas.h5 files
+		input_fofn = subreads.fasta.fofn
+		#input_fofn = preads.fofn
+
+		input_type = raw
+		#input_type = preads
+
+		#openending = True
+
+		# The length cutoff used for seed reads used for initial mapping
+		#length_cutoff = 10000
+		genome_size = 639032215
+		seed_coverage = 50
+
+		# The length cutoff used for seed reads usef for pre-assembly
+		length_cutoff_pr = 1000
+
+		#pa_REPmask_code = 1,300;0,300;0,300
+		pa_daligner_option   = -e.8 -l1000 -k18 -h480  -w8 -s100
+		ovlp_daligner_option = -e.9 -l1000 -k24 -h1024 -w6 -s100
+		pa_HPCdaligner_option   =  -v -B128 -M24
+		ovlp_HPCdaligner_option =  -v -B128 -M24
+		#pa_HPCTANmask_option = -k18 -h480 -w8 -e.8 -s100
+		#pa_HPCREPmask_option = -k18 -h480 -w8 -e.8 -s100
+
+		pa_DBsplit_option = -a -x500 -s200
+		ovlp_DBsplit_option = -s200
+
+		falcon_sense_option = --output-multi --min-cov-aln 10 --min-idt 0.70 --min-cov 4 --max-n-read 500 --n-core 100
+		falcon_sense_skip_contained = False
+
+		overlap_filtering_setting = --max-diff 180 --max-cov 120 --min-cov 4 --n-core 100
+		#dazcon = 1
+
+		[job.defaults]
+		job_type = local
+
+		#use_tmpdir = /scratch
+		pwatcher_type = blocking
+		job_type = string
+		submit = bash -C ${CMD} >| ${STDOUT_FILE} 2>| ${STDERR_FILE}
+		#job_queue = bash -C ${CMD}
+		# By dropping STD*_FILE, we see all output on the console.
+		# That helps debugging in TravisCI/Bamboo.
+
+		NPROC=15
+		MB=250000
+		njobs=8
+		#njobs=1
+		[job.step.da]
+		[job.step.pda]
+		[job.step.la]
+		#NPROC=1
+		[job.step.pla]
+		#NPROC=1
+		[job.step.cns]
+		#njobs=1
+
+		[job.step.asm]
+		
+	##commond
+	 fc_run.py fc_run.cfg
+2. polish with arrow
+	cat run.sh
+		pbmm2 align subreads.bam ref.input.fa | samtools sort -@ 20 > mapped.bam
+		pbindex mapped.bam
+		samtools faidx ref.input.fa
+		gcpp --algorithm=arrow -r ref.input.fa -o consensus.fa,consensus.vcf,consensus.fq  -j 128  mapped.bam
+		settk seq -a consensus.fq >consensus.fa
+	./run.sh
+
+
+3. polish using pilon
+	cat run.sh
+		ref="consensus.fa"
+		bwa index ${ref}
+		bwa mem -t 120 ${ref} ${sp}_1_clean.fq.gz ${sp}_2_clean.fq.gz |samtools view -b --reference ${ref} --threads 120 |samtools sort --threads 120 -o  ${sp}.pilon.bam --reference ${ref}
+		samtools index -@ 110 ${sp}.pilon.bam
+		sambamba markdup -t 110 ${sp}.pilon.bam ${sp}.pilon.markdup.bam
+		samtools index -@110 ${sp}.pilon.markdup.bam
+		java -Xmx400G -jar ./pilon-1.23.jar --genome ${ref} --frags ${sp}.pilon.bam --output ${sp}.pilon --outdir pilon --changes  --vcf --tracks  --diploid   --threads 120 --minmq 30 --minqual 20
+	./run.sh
+
+4. scaffold the contig to chromosome
+	cat ./run.sh
+
+		genome="/###/Tbl.pilon.fasta"
+		gmID="juice"
+		juiceDir="/###/juicer"
+		awk 'BEGIN{a=0}{if(/>/){a++;print ">Tbl_"a}else{print $0}}'  ${genome} >$juiceDir/references/${gmID}.fasta
+		bwa index $juiceDir/references/${gmID}.fasta
+		$juiceDir/misc/generate_site_positions.py MboI ${gmID}  $juiceDir/references/${gmID}.fasta
+		mv ${gmID}_MboI.txt $juiceDir/restriction_sites/
+		samtools faidx $juiceDir/references/${gmID}.fasta
+		cut -f 1-2 $juiceDir/references/${gmID}.fasta.fai >$juiceDir/references/${gmID}.chrom.sizes
+		###############
+		#must modify the path of juice line77
+		############################add genome ID line178
+		mkdir fastq
+		ln -s fastq ./fastq
+		$juiceDir/scripts/juicer.sh -d /absolutepath/  -g ${gmID} –s MboI –z $juiceDir/references/${gmID}.fasta -t 50 –y $juiceDir/restriction_sites/${gmID}_MboI.txt -p $juiceDir/references/${gmID} -D $juiceDir
+
+		
+		###3D de novo assembly (3D-DNA) pipeline with AGWG-specific modifications
+		###https://github.com/theaidenlab/AGWG-merge
+		##Step 0: Draft contigs
+		ln -s $juiceDir/references/juice.fasta  AGWG.draft.fasta
+		awk -f /software/3d-dna.AGWG/utils/generate-assembly-file-from-fasta.awk AGWG.draft.fasta > AGWG.draft.assembly
+		ln -sf ./aligned/merged_nodups.txt AGWG.mnd.draft.txt
+
+		####Preliminary scaffolding
+		# prep
+		awk -f /software/3d-dna.AGWG/utils/convert-assembly-to-cprop-and-asm.awk AGWG.draft.assembly
+		###files:AGWG.draft.cprops,AGWG.draft.asm
+		# order and orient scaffolds larger than 20000
+		bash /software/3d-dna.AGWG/scaffold/run-liger-scaffolder.sh -s 20000 AGWG.draft.cprops AGWG.mnd.draft.txt
+		##modified the file AGWG,draft.asm
+
+		# build high-resolution hic map with mapq >= 1 (default)
+		bash /software/3d-dna.AGWG/visualize/run-asm-visualizer.sh -r 2500000,1000000,500000,250000,100000,50000,25000,10000,5000,1000,500 AGWG.draft.cprops AGWG.draft.asm AGWG.mnd.draft.txt
+		###mofified the file AGWG.draft.assembly
+		###output files: temp.AGWG.draft.asm_mnd.txt AGWG.draft_asm.scaffold_track.txt, AGWG.draft_asm.superscaf_track.txt
+
+		# build supplementary high-resolution hic maps with reads mapping quality >=30
+		bash /software/3d-dna.AGWG/visualize/run-asm-visualizer.sh -q 30 -m temp.AGWG.0.asm_mnd.txt -r 2500000,1000000,500000,250000,100000,50000,25000,10000,5000,1000,500 -c AGWG.draft.cprops AGWG.draft.asm AGWG.mnd.draft.txt
+
+
+
+		##Step 2: Curated misjoin correction
+		###juicebox adjust
+
+		####Step 3: Curated polishing and chromosome splitting
+		# prep
+		date
+		echo "ln -sf AGWG.draft.review.assembly AGWG.rawchrom.assembly"
+		ln -sf AGWG.draft.review.assembly AGWG.rawchrom.assembly
+		date
+		echo "awk -f /software/3d-dna.AGWG/utils/convert-assembly-to-cprop-and-asm.awk AGWG.rawchrom.assembly"
+		awk -f /software/3d-dna.AGWG/utils/convert-assembly-to-cprop-and-asm.awk AGWG.rawchrom.assembly
+		date
+		echo "bash /software/3d-dna.AGWG/edit/edit-mnd-according-to-new-cprops.sh AGWG.rawchrom.cprops AGWG.mnd.draft.txt > AGWG.mnd.rawchrom.txt"
+		bash /software/3d-dna.AGWG/edit/edit-mnd-according-to-new-cprops.sh AGWG.rawchrom.cprops AGWG.mnd.draft.txt > AGWG.mnd.rawchrom.txt
+		# generate a high-resolution Hi-C map to visualize pre-merge assembly with default mapping quality threshold (mapq>=1)
+		date
+		echo "bash /software/3d-dna.AGWG/visualize/run-assembly-visualizer.sh -r 2500000,1000000,500000,250000,100000,50000,25000,10000,5000,1000,500 AGWG.rawchrom.assembly AGWG.mnd.rawchrom.txt"
+		bash /software/3d-dna.AGWG/visualize/run-assembly-visualizer.sh -r 2500000,1000000,500000,250000,100000,50000,25000,10000,5000,1000,500 AGWG.rawchrom.assembly AGWG.mnd.rawchrom.txt
+		###output files: temp.AGWG.rawchrom.asm_mnd.txt, AGWG.rawchrom_asm.scaffold_track.txt, AGWG.rawchrom_asm.superscaf_track.txt, AGWG.rawchrom.hic
+
+		# generate supplementary Hi-C maps to visualize pre-merge assembly with mapq>=30
+		#bash /software/3d-dna.AGWG/visualize/run-assembly-visualizer.sh -q 30 -m temp.AGWG.rawchrom.asm_mnd.txt -r 2500000,1000000,500000,250000,100000,50000,25000,10000,5000,1000,500 -c AGWG.rawchrom.assembly AGWG.mnd.rawchrom.txt
+
+
+		####Step 4: Automatic pairwise alignment of nearby contigs
+		# prep
+		date
+		echo "awk -f /software/3d-dna.AGWG/edit/edit-fasta-according-to-new-cprops.awk AGWG.rawchrom.cprops AGWG.draft.fasta > AGWG.rawchrom.fasta"
+		awk -f /software/3d-dna.AGWG/edit/edit-fasta-according-to-new-cprops.awk AGWG.rawchrom.cprops AGWG.draft.fasta > AGWG.rawchrom.fasta
+		###output file: AGWG.rawchrom.fasta
+		date
+		echo "mkdir faSplit && cd faSplit && awk -f ${path_to_3ddna}/merge/split-fasta-by-cname.awk ../AGWG.rawchrom.cprops ../AGWG.rawchrom.fasta && cd .."
+		mkdir faSplit && cd faSplit && awk -f /home/leon/software/3d-dna.AGWG/merge/split-fasta-by-cname.awk ../AGWG.rawchrom.cprops ../AGWG.rawchrom.fasta && cd ..
+		###output document: faSplit/
+
+		# perform pairwise alignment of all input contigs/scaffolds within set distance and filter using alignment scores, length and identity to select probable alternative haplotype sequences
+		date
+		echo "bash /software/3d-dna.AGWG/merge/align-nearby-sequences-and-filter-overlaps.sh AGWG.rawchrom.cprops AGWG.rawchrom.asm faSplit"
+		bash /software/3d-dna.AGWG/merge/align-nearby-sequences-and-filter-overlaps.sh AGWG.rawchrom.cprops AGWG.rawchrom.asm faSplit
+		###output files joblist.txt, alignments.txt, overlaps_2D_input.txt, overlaps_2D_asm.txt
+
+		# tile based on filtered alignment results
+		date
+		echo "bash /software/3d-dna.AGWG/merge/tile-assembly-based-on-overlaps.sh AGWG.rawchrom.cprops AGWG.rawchrom.asm overlaps_2D_input.txt"
+		bash  /software/3d-dna.AGWG/merge/tile-assembly-based-on-overlaps.sh AGWG.rawchrom.cprops AGWG.rawchrom.asm overlaps_2D_input.txt
+		### error: :( Some pairwise alignments are in conflict. Skipping merge block +000183F +000045F +000129F +000095F -000127F -000068F -000058F +000127F +000239F -000078F +000068F +000057F -000052F -000095F +000078F +000052F -000023F +000058F -000057F -000129F +000023F!
+		##output AGWG.rawchrom_tiled.asm
+
+		# generate a high-resolution Hi-C map to visualize pre-merge assembly with default mapping quality threshold (mapq>=1)
+		date
+		echo 'cat <(awk '{$0=">"$0}1' AGWG.rawchrom.cprops) <(awk '{gsub("{|}","")}1' AGWG.rawchrom_tiled.asm) > AGWG.rawchrom_tiled.assembly'
+		cat <(awk '{$0=">"$0}1' AGWG.rawchrom.cprops) <(awk '{gsub("{|}","")}1' AGWG.rawchrom_tiled.asm) > AGWG.rawchrom_tiled.assembly
+		date
+		echo "bash /software/3d-dna.AGWG/visualize/run-assembly-visualizer.sh -r 2500000,1000000,500000,250000,100000,50000,25000,10000,5000,1000,500 AGWG.rawchrom_tiled.assembly AGWG.mnd.rawchrom.txt"
+		bash  /software/3d-dna.AGWG/visualize/run-assembly-visualizer.sh -r 2500000,1000000,500000,250000,100000,50000,25000,10000,5000,1000,500 AGWG.rawchrom_tiled.assembly AGWG.mnd.rawchrom.txt
+		###output ifles:temp.AGWG.rawchrom_tiled.asm_mnd.txt, AGWG.rawchrom_tiled_asm.scaffold_track.txt, AGWG.rawchrom_tiled_asm.superscaf_track.txt, AGWG.rawchrom_tiled.hic
+
+		# generate supplementary Hi-C maps to visualize pre-merge assembly with mapq>=30
+		bash  /software/3d-dna.AGWG/visualize/run-assembly-visualizer.sh -q 30 -m temp.AGWG.rawchrom.asm_mnd.txt -r 2500000,1000000,500000,250000,100000,50000,25000,10000,5000,1000,500 -c AGWG.rawchrom_tiled.assembly AGWG.mnd.rawchrom.txt
+
+
+
+		###Step 5: adjuxt by juicebox
+
+		###setp 6: Curation of merge groups
+		# prep
+		date
+		#echo "awk -f /software/3d-dna.AGWG/utils/convert-assembly-to-cprops-and-asm.awk AGWG.rawchrom_tiled.review.assembly"
+		#awk -f  /software/3d-dna.AGWG/utils/convert-assembly-to-cprop-and-asm.awk AGWG.rawchrom_tiled.review.assembly
+		ln -s AGWG.rawchrom_tiled.assembly AGWG.rawchrom_tiled.review.assembly
+		###output files: AGWG.rawchrom_tiled.review.cprops, AGWG.rawchrom_tiled.review.asm
+		date
+		echo "bash /software/3d-dna.AGWG/edit/edit-mnd-according-to-new-cprops.sh AGWG.rawchrom_tiled.curated.cprops AGWG.mnd.txt > AGWG.rawchrom_tiled.curated.txt"
+		bash  /software/3d-dna.AGWG/edit/edit-mnd-according-to-new-cprops.sh AGWG.rawchrom_tiled.review.cprops AGWG.mnd.draft.txt > AGWG.mnd.rawchrom_tiled.review.txt
+		##output file: AGWG.mnd.rawchrom_tiled.review.txt
+		##
+		# build high-resolution hic map with mapq >= 1 (default)
+		date
+		echo "sh /software/3d-dna.AGWG/visualize/run-assembly-visualizer.sh -r 2500000,1000000,500000,250000,100000,50000,25000,10000,5000,1000,500 AGWG.rawchrom_tiled.curated.assembly AGWG.rawchrom_tiled.curated.txt"
+		bash  /software/3d-dna.AGWG/visualize/run-assembly-visualizer.sh -r 2500000,1000000,500000,250000,100000,50000,25000,10000,5000,1000,500 AGWG.rawchrom_tiled.review.assembly AGWG.mnd.rawchrom_tiled.review.txt
+		###output AGWG.rawchrom_tiled.hic
+		# build supplementary high-resolution hic maps with reads mapping quality >=30
+		bash  /software/3d-dna.AGWG/visualize/run-asm-visualizer.sh -q 30 -m temp.AGWG.rawchrom_tiled.curated.asm_mnd.txt -r 2500000,1000000,500000,250000,100000,50000,25000,10000,5000,1000,500 -c AGWG.rawchrom_tiled.curated.assembly AGWG.rawchrom_tiled.curated.txt
+
+
+
+		####Step 7: Automatic merging of overlapping contigs
+		# create new haploid contigs by merging connected components defined in the tiled assembly file
+		date
+		echo "bash /software/3d-dna.AGWG/merge/merge-tiled-asm.sh -a AGWG.rawchrom_tiled.review_asm.scaffold_track.txt AGWG.rawchrom.cprops AGWG.rawchrom_tiled.review.asm faSplit"
+		bash  /software/3d-dna.AGWG/merge/merge-tiled-asm.sh -a AGWG.rawchrom_tiled.review_asm.scaffold_track.txt AGWG.rawchrom.cprops AGWG.rawchrom_tiled.review.asm faSplit
+		##output document:AGWG.rawchrom/
+		# finalize output from haploid contigs to haploid chromosome-length scaffolds
+		date
+		echo "cp AGWG.rawchrom/AGWG.rawchrom_merged.asm AGWG.final.asm"
+		cp AGWG.rawchrom/AGWG.rawchrom_merged.asm AGWG.final.asm
+		date
+		echo "ln -sf AGWG.rawchrom/merged_AGWG.rawchrom.fa AGWG.final.fasta"
+		ln -sf AGWG.rawchrom/merged_AGWG.rawchrom.fa AGWG.final.fasta
+		date
+		echo "awk -f /software/3d-dna.AGWG/utils/generate-cprops-file.awk AGWG.final.fasta > AGWG.final.cprops"
+		awk -f  /software/3d-dna.AGWG/utils/generate-cprops-file.awk AGWG.final.fasta > AGWG.final.cprops
+		date
+		echo "bash  /software/3d-dna.AGWG/finalize/finalize-output.sh -l AGWG AGWG.final.cprops AGWG.final.asm AGWG.final.fasta final"
+		bash  /software/3d-dna.AGWG/finalize/finalize-output.sh -l AGWG AGWG.final.cprops AGWG.final.asm AGWG.final.fasta final
+	./run.sh
+5. gapfill with pbjelly
+	cat ./run.sh
+		ln -s /###/AGWG.FINAL.fasta ./genome.fasta
+		samtools faidx genome.fasta
+		head -n 48 >Tbl.chr.fa ##get the chromosome-level assembly
+		ln -s Tbl.chr.fa ./ref.fasta
+		software/PBJelly/pbsuite/utils/fakeQuals.py ref.fasta ref.qual
+		Jelly.py setup ./Protocol.xml
+		Jelly.py mapping ./Protocol.xml
+		Jelly.py support ./Protocol.xml
+		Jelly.py extraction ./Protocol.xml
+		Jelly.py assembly ./Protocol.xml -x "--nproc=100"
+		Jelly.py output ./Protocol.xml
+6. ISO3: to get full length transcript
+		cat ./run.sh
+		#step 1
+		ccs subreads.bam ccs.bam --min-rq 0.8 --report-file ccs_report.txt --min-passes 2
+		##step2
+		lima  ccs.bam primer.fa  fl.bam --isoseq --peek-guess
+		##cluster
+		isoseq3 cluster fl.primer_5p--primer_3p.bam flnc.bam --verbose --use-qvs
+
+7. funannotate
+		STRAIN=Tbl
+		SPECIES="Trachinotus blochii"
+		TRINITY_TRANSCRIPT=transcripts.fa
+		GENOME=reference.fa
+		CPU=50
+		
+		funannotate clean -i $GENOME --minlen 10000 -o genome.cleaned.fa
+		funannotate sort -i genome.cleaned.fa -b scaffold -o genome.cleaned.sorted.fa
+		funannotate mask -i reference.fa --cpus $CPU -o MyAssembly.fa
+
+		hisat2-build -p 20 MyAssembly.fa genome
+		hisat2 -p 20 -x genome --dta -1 merged_1.fq.gz -2 merged_2.fq.gz | samtools sort -@ 20 > RNA.bam
+		minimap2 -t 30 -ax splice -uf --secondary=no  Assembly.fa flnc.fa   |samtools sort -@ 30  | samtools view -@ 30  -O BAM -o iso.bam
+		# merge gtf
+		stringtie -p 30 --conservative  --mix -o stringtie.gtf  RNA.bam iso.bam
+		gffread stringtie.gtf -g MyAssembly.fa  -w transcripts.fasta -V
+		
+		funannotate train -i  MyAssembly.fa -o train  \
+		--left  B20190716_1.clean.fq.gz C20190716_1.clean.fq.gz N20190716_1.clean.fq.gz PF20190716_1.clean.fq.gz S20190716_1.clean.fq.gz SZ20190716_1.clean.fq.gz XZ20
+		190716_1.clean.fq.gz  \
+		--right B20190716_2.clean.fq.gz C20190716_2.clean.fq.gz N20190716_2.clean.fq.gz PF20190716_2.clean.fq.gz S20190716_2.clean.fq.gz SZ20190716_2.clean.fq.gz XZ20
+		190716_2.clean.fq.gz \
+		--pacbio_isoseq flnc.fa  \
+		--trinity transcripts.fa \
+		--no_trimmomatic \
+		--no_normalize_reads \
+		--memory 100G \
+		--species "$SPECIES" \
+		--max_intronlen 200000 \
+		--strain "$STRAIN" \
+		--cpus $CPU
+
+		##protein.evidence.fa was merged the ten fish species.
+		funannotate predict -i MyAssembly.fa \
+		-o train -s "$SPECIES" --strain $STRAIN --cpus $CPU \
+		--max_intronlen 200000 \
+		--weights augustus:1 hiq:10 pasa:10 snap:0 genemark:0 glimmerhmm:0 transcripts:10 proteins:10 \
+		--optimize_augustus \
+		--busco_db actinopterygii \
+		--busco_seed_species zebrafish \
+		--organism other \
+		--protein_evidence protein.evidence.fa \
+		--min_protlen 10 \
+		--repeat_filter none
+		
+		funannotate update -i train \
+		--left  B20190716_1.clean.fq.gz C20190716_1.clean.fq.gz N20190716_1.clean.fq.gz PF20190716_1.clean.fq.gz S20190716_1.clean.fq.gz S
+		Z20190716_1.clean.fq.gz XZ20190716_1.clean.fq.gz  \
+		--right B20190716_2.clean.fq.gz C20190716_2.clean.fq.gz N20190716_2.clean.fq.gz PF20190716_2.clean.fq.gz S201
+		90716_2.clean.fq.gz SZ20190716_2.clean.fq.gz XZ20190716_2.clean.fq.gz \
+		--pacbio_isoseq flnc.fa  \
+		--trinity transcripts.fa \
+		--cpus $CPU \
+		--alt_transcripts 0.3 \
+		--no_normalize_reads --no_trimmomatic 
+		
+
+		ln -s ./train/update_results/Trachinotus_blochii_Tbl.mrna-transcripts.fa transcripts.fasta
+		ln -s ./tain/update_results/Trachinotus_blochii_Tbl.gff3 ./transcripts.gff3
+		/software/TransDecoder-TransDecoder-v5.5.0/TransDecoder.LongOrfs -t transcripts.fasta
+		# -------------------------------------------------------------------------------------- #
+		# homology searc
+		diamond blastp -d /software/funannotate/funannotate_db/uniprot -q transcripts.fasta.transdecoder_dir/longest_orfs.pep --threads 100  --evalue 1e-5 --max-target-seqs 1 > blastp.outfmt6
+		wget -c ftp://ftp.ebi.ac.uk/pub/databases/Pfam/releases/Pfam34.0/Pfam-A.hmm.gz
+		gunzip Pfam-A.hmm.gz
+		hmmpress Pfam-A.hmm
+		hmmscan --cpu 100 -E 1e-5 --domtblout pfam.domtblout /software/Annotation/Pfam-A.hmm transcripts.fasta.transdecoder_dir/longest_orfs.pep
+		# -------------------------------------------------------------------------------------- #
+
+		/software/TransDecoder-TransDecoder-v5.5.0/TransDecoder.Predict --single_best_only -t transcripts.fasta --retain_pfam_hits pfam.domtblout --retain_blastp_hits blastp.outfmt6
+
+		/software/TransDecoder-TransDecoder-v5.5.0/util/cdna_alignment_orf_to_genome_orf.pl transcripts.fasta.transdecoder.gff3 transcripts.gff3 transcripts.fasta > transcripts.fasta.transdecoder.genome.gff3
+
+		funannotate annotate --iprscan --gff transcripts.fasta.transdecoder.genome.gff3 --fasta MyAssembly.fa -s  "Trachinotus blochii" --strain Tbl -o fun.ann  -m local --iprscan_path /software/myinterproscan/interproscan-5.36-75.0/interproscan.sh --eggnog --cpus 110 --busco_db actinopterygii
+
+
+8. ortholog inference
+		dNdS(query_file= "Trachinotus_blochii_BC.cds-transcripts.fa",subject_file = "Trachinotus_ovatus_Tov.cds-transcripts.fa",delete_corrupt_cds = TRUE,ortho_detection = "RBH", aa_aln_type= "pairwise",aa_aln_tool= "NW",codon_aln_tool  = "pal2nal",dnds_est.method = "Comeron",comp_cores = 10)
+
+
+9. get 4dsite
+		./4D.align.pl
+
+10. Hyde
+	
+	bcftools annotate --set-id +'%CHROM\_%POS' reseq.f.vcf.gz -Oz -o reseq.f.an.vcf.gz
+	vcftools --gzvcf reseq.f.an.vcf.gz --keep anak-4.blochii.txt --recode --recode-INFO-all --stdout | gzip -c > reseq.reseq.f.anak-4.blochii.vcf.gz
+	plink --vcf reseq.reseq.f.anak-4.blochii.vcf.gz --const-fid --allow-extra-chr --indep-pairwise 50 10 0.2 --out reseq.f.an
+	vcftools --gzvcf reseq.f.an.vcf.gz --snps reseq.f.an.prune.in --recode --recode-INFO-all --stdout | gzip -c > reseq.reseq.f.an.LD.vcf.gz
+	vcftools --gzvcf reseq.vcf.gz --keep keep.anak.blochii.carolinus.txt --min-alleles 2 --max-missing 1.0 --mac 1 --recode --recode-INFO-all --stdout | gzip -c > hyde.vcf.gz
+	./vcf2phylip/vcf2phylip.py -i hyde.vcf.gz
+	run_hyde.py -i  hyde.min.phy  -m map_hyde_reseq -tr Triples_byde_reseq -o carolinus -n 87 -t 4 -s 434878
+	individual_hyde.py -i hyde.min.phy -m map_hyde_reseq -tr hyde-out.txt -o carolinus  -n 87 -t 4 -s 434878
+
+
+11. mcmctree
+	cat mcmctree.ctl
+		seed = -1
+		seqfile = 4D.trim_mcmctree.fa
+		treefile = tree.newick
+		outfile = mcmctree.out
+
+		ndata = 1      * number of partitions
+		usedata = 3    * 0: no data; 1:seq like; 2:use in.BV; 3: out.BV
+		clock = 2      * 1: global clock; 2: independent rates; 3: correlated rates
+		RootAge = '<3.85' * safe constraint on root age, used if no fossil for root
+
+		model = 7    * 0:JC69, 1:K80, 2:F81, 3:F84, 4:HKY85
+		alpha = 1   * alpha for gamma rates at sites
+		ncatG = 5    * No. categories in discrete gamma
+
+		BDparas = 1 1 0.1      * birth, death, sampling
+		kappa_gamma = 6 2   * gamma prior for kappa
+		alpha_gamma = 1 1    * gamma prior for alpha
+
+		rgene_gamma = 2 20 1   * gamma prior for mean rates for genes
+		sigma2_gamma = 1 10 1  * gamma prior for sigma^2 (for clock=2 or 3)
+
+		print = 2
+		burnin = 100000
+		sampfreq = 10
+		nsample = 1000000
+
+	mcmctree mcmctree.ctl
+	mv out.BV in.BV
+	perl -p -i -e 's/usedata = 3/usedata = 2/' mcmctree.ctl
+	mcmctree mcmctree.ctl
