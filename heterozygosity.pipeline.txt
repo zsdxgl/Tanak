@@ -1,0 +1,36 @@
+
+
+##spades
+spades.py -1 $sp_1.fq.gz -2 $sp_2.fq.gz -t 100 -o $sp
+
+
+###BUSCO
+
+busco -i $ref -m genome --augustus -o $out -f  -c 50 --download_path $path/busco_downloads -l actinopterygii_odb10 --offline
+
+##out: 1. the fuu_table.tsv; 2. gff  
+###
+cd $buscoout/run_actinopterygii_odb10/augustus_output/gff
+for i in {}  ##genes
+do
+        /$path/Reseqtools/iTools_Code/iTools Gfftools getCdsPep -Ref $ref -Gff ${i}.gff -OutPut ${i} -4DSite
+done
+##out example: 43181at7898.4Dsite.gz
+
+###get signle-copy gene regions and the position　of fourfold degenerate sites
+ls *
+anak.fna
+anak.full_table.tsv
+anak.gff
+anak.scj ..$buscoput/run_actinopterygii_odb10/busco_sequences/single_copy_busco_sequences
+
+./getgenepl
+### ovatus.txt; ovatus.4Dsites.txt
+
+sort -k1,1V -k2,2n ovatus.txt >ovatus.sort.txt
+sort -k1,1V -k2,2n ovatus.4Dsites.txt >ovatus.4Dsites.sort.txt
+bcftools mpileup -Ou -q 30 -Q 20 -f scaffolds.fasta -R ovatus.sort.txt --rf 0x2 --ff 0x100 --ff DUP --ff 0x800 -b bam.list  --threads 30 -a "FORMAT/AD,FORMAT/DP" | bcftools call --threads 30 -V indels  -cO z -o ovatus.vcf.gz
+perl /data1/guoliang/Tov/T.new.aquaculture/het_ratio.pl ovatus.vcf.gz ovatus.4Dsites.sort.txt >ovatus.het
+
+
+
